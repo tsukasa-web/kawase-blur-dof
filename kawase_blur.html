@@ -1,0 +1,810 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Depth of Field with Kawase Blur</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            font-family: Arial, sans-serif;
+        }
+        canvas {
+            display: block;
+        }
+        #info {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            color: white;
+            background: rgba(0, 0, 0, 0.8);
+            padding: 15px;
+            border-radius: 5px;
+            z-index: 100;
+            min-width: 280px;
+        }
+        #info div {
+            margin: 8px 0;
+        }
+        .section-title {
+            font-weight: bold;
+            margin-top: 15px !important;
+            padding-top: 10px;
+            border-top: 1px solid rgba(255,255,255,0.3);
+        }
+        .section-title:first-child {
+            margin-top: 0 !important;
+            padding-top: 0;
+            border-top: none;
+        }
+        label {
+            display: inline-block;
+            width: 140px;
+            font-size: 12px;
+        }
+        input[type="range"] {
+            width: 120px;
+        }
+        input[type="checkbox"] {
+            margin-left: 5px;
+        }
+        .value-display {
+            display: inline-block;
+            width: 40px;
+            text-align: right;
+            font-family: monospace;
+        }
+    </style>
+</head>
+<body>
+    <div id="info">
+        <div><b>Depth of Field Demo</b></div>
+        <div style="font-size: 11px; color: #aaa;">マウス: カメラ回転 | クリック: フォーカス設定</div>
+        
+        <div class="section-title">DOF Settings</div>
+        <div>
+            <label>Enable DOF:</label>
+            <input type="checkbox" id="enableDOF" checked>
+        </div>
+        <div>
+            <label>Focus Distance:</label>
+            <input type="range" id="focusDistance" min="1" max="50" value="15" step="0.5">
+            <span class="value-display" id="focusDistanceValue">15</span>
+        </div>
+        <div>
+            <label>Aperture (F-stop):</label>
+            <input type="range" id="aperture" min="0.5" max="22" value="2.8" step="0.1">
+            <span class="value-display" id="apertureValue">2.8</span>
+        </div>
+        <div>
+            <label>Bokeh Amount:</label>
+            <input type="range" id="bokehAmount" min="0" max="5" value="2" step="0.1">
+            <span class="value-display" id="bokehAmountValue">2</span>
+        </div>
+        <div>
+            <label>Max Blur:</label>
+            <input type="range" id="maxBlur" min="0" max="20" value="10" step="0.5">
+            <span class="value-display" id="maxBlurValue">10</span>
+        </div>
+        <div>
+            <label>Auto Focus:</label>
+            <input type="checkbox" id="autoFocus">
+        </div>
+        <div>
+            <label>Show Depth:</label>
+            <input type="checkbox" id="showDepth">
+        </div>
+
+        <div class="section-title">Blur Settings</div>
+        <div>
+            <label>Blur Passes:</label>
+            <input type="range" id="blurPasses" min="1" max="5" value="3" step="1">
+            <span class="value-display" id="blurPassesValue">3</span>
+        </div>
+
+        <div class="section-title">Animation</div>
+        <div>
+            <label>Animate:</label>
+            <input type="checkbox" id="animate" checked>
+        </div>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.min.js';
+
+        // グローバル変数
+        let camera, scene, renderer;
+        let ribbonGroup, objectsGroup;
+        let mouseX = 0, mouseY = 0;
+        let targetX = 0, targetY = 0;
+        const windowHalfX = window.innerWidth / 2;
+        const windowHalfY = window.innerHeight / 2;
+        let raycaster = new THREE.Raycaster();
+        let mouse = new THREE.Vector2();
+
+        // ポストプロセシング用
+        let depthRenderTarget, sceneRenderTarget;
+        let blurRenderTarget1, blurRenderTarget2, cocRenderTarget;
+        let depthMaterial, cocMaterial, dofMaterial, blurMaterial, outputMaterial, depthVisMaterial;
+        let fullScreenQuad;
+        let postScene, postCamera;
+
+        // パラメータ
+        const params = {
+            enableDOF: true,
+            focusDistance: 15,
+            aperture: 2.8,
+            bokehAmount: 2,
+            maxBlur: 10,
+            blurPasses: 3,
+            autoFocus: false,
+            showDepth: false,
+            animate: true
+        };
+
+        // Depth Material (深度情報を取得)
+        const depthVertexShader = `
+            varying float vDepth;
+            void main() {
+                vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+                vDepth = -mvPosition.z;
+                gl_Position = projectionMatrix * mvPosition;
+            }
+        `;
+
+        const depthFragmentShader = `
+            varying float vDepth;
+            uniform float near;
+            uniform float far;
+            void main() {
+                float depth = (vDepth - near) / (far - near);
+                gl_FragColor = vec4(depth, depth, depth, 1.0);
+            }
+        `;
+
+        // CoC (Circle of Confusion) 計算シェーダー
+        const cocVertexShader = `
+            varying vec2 vUv;
+            void main() {
+                vUv = uv;
+                gl_Position = vec4(position, 1.0);
+            }
+        `;
+
+        const cocFragmentShader = `
+            varying vec2 vUv;
+            uniform sampler2D tDepth;
+            uniform float focusDistance;
+            uniform float aperture;
+            uniform float maxBlur;
+            uniform float near;
+            uniform float far;
+            
+            float getCoC(float depth) {
+                // 実際の距離に変換
+                float realDepth = near + depth * (far - near);
+                
+                // フォーカス距離との差を計算
+                float diff = abs(realDepth - focusDistance);
+                
+                // より控えめなCoC計算
+                float coc = diff / (focusDistance + 10.0);
+                
+                // F値の影響（より自然に）
+                coc *= (4.0 / aperture);
+                
+                // 段階的なカーブ
+                coc = pow(coc, 1.2);
+                
+                // 0.5を超えないように制限
+                return clamp(coc, 0.0, 0.8);
+            }
+            
+            void main() {
+                float depth = texture2D(tDepth, vUv).r;
+                float coc = getCoC(depth);
+                gl_FragColor = vec4(coc, depth, 0.0, 1.0);
+            }
+        `;
+
+        // DOF合成シェーダー
+        const dofVertexShader = `
+            varying vec2 vUv;
+            void main() {
+                vUv = uv;
+                gl_Position = vec4(position, 1.0);
+            }
+        `;
+
+        const dofFragmentShader = `
+            varying vec2 vUv;
+            uniform sampler2D tScene;
+            uniform sampler2D tBlur;
+            uniform sampler2D tCoC;
+            uniform float bokehAmount;
+            
+            void main() {
+                vec3 originalColor = texture2D(tScene, vUv).rgb;
+                vec3 blurredColor = texture2D(tBlur, vUv).rgb;
+                float coc = texture2D(tCoC, vUv).r;
+                
+                // CoCに基づく混合係数の計算
+                float mixFactor = smoothstep(0.1, 0.9, coc * bokehAmount);
+                
+                // シンプルな線形補間
+                vec3 finalColor = mix(originalColor, blurredColor, mixFactor);
+                
+                gl_FragColor = vec4(finalColor, 1.0);
+            }
+        `;
+
+        // Kawase Blur Shader (改良版)
+        const blurVertexShader = `
+            varying vec2 vUv;
+            void main() {
+                vUv = uv;
+                gl_Position = vec4(position, 1.0);
+            }
+        `;
+
+        const blurFragmentShader = `
+            uniform sampler2D tDiffuse;
+            uniform sampler2D tCoC;
+            uniform vec2 resolution;
+            uniform float iteration;
+            uniform float maxBlur;
+            varying vec2 vUv;
+
+            void main() {
+                vec2 texelSize = 1.0 / resolution;
+                float coc = texture2D(tCoC, vUv).r;
+                
+                // CoCに基づいてオフセットを計算
+                float offset = (0.5 + iteration) * coc * maxBlur * 0.5;
+                vec2 uvOffset = texelSize * offset;
+                
+                vec4 color = vec4(0.0);
+                
+                // シンプルな4タップKawaseブラー
+                color += texture2D(tDiffuse, vUv + vec2(-uvOffset.x, -uvOffset.y));
+                color += texture2D(tDiffuse, vUv + vec2(uvOffset.x, -uvOffset.y));
+                color += texture2D(tDiffuse, vUv + vec2(-uvOffset.x, uvOffset.y));
+                color += texture2D(tDiffuse, vUv + vec2(uvOffset.x, uvOffset.y));
+                
+                gl_FragColor = color * 0.25;
+            }
+        `;
+
+        // Output shader
+        const outputVertexShader = `
+            varying vec2 vUv;
+            void main() {
+                vUv = uv;
+                gl_Position = vec4(position, 1.0);
+            }
+        `;
+
+        const outputFragmentShader = `
+            uniform sampler2D tDiffuse;
+            varying vec2 vUv;
+            void main() {
+                gl_FragColor = texture2D(tDiffuse, vUv);
+            }
+        `;
+
+        // Depth visualization shader
+        const depthVisVertexShader = `
+            varying vec2 vUv;
+            void main() {
+                vUv = uv;
+                gl_Position = vec4(position, 1.0);
+            }
+        `;
+
+        const depthVisFragmentShader = `
+            uniform sampler2D tDepth;
+            uniform sampler2D tCoC;
+            varying vec2 vUv;
+            void main() {
+                float depth = texture2D(tDepth, vUv).r;
+                float coc = texture2D(tCoC, vUv).r;
+                
+                // 深度を可視化（近い=青、遠い=赤）
+                vec3 color = vec3(depth, 1.0 - depth, 1.0 - depth);
+                
+                // CoCの強さを緑チャンネルで表示
+                color.g *= 1.0 - coc;
+                
+                gl_FragColor = vec4(color, 1.0);
+            }
+        `;
+
+        function init() {
+            // レンダラー
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            document.body.appendChild(renderer.domElement);
+
+            // カメラ
+            camera = new THREE.PerspectiveCamera(
+                60,
+                window.innerWidth / window.innerHeight,
+                1,
+                100
+            );
+            camera.position.z = 25;
+
+            // シーン
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x000022);
+            scene.fog = new THREE.Fog(0x000022, 20, 60);
+
+            // ライト
+            const ambientLight = new THREE.AmbientLight(0x404040, 0.5);
+            scene.add(ambientLight);
+
+            const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
+            directionalLight.position.set(10, 10, 5);
+            scene.add(directionalLight);
+
+            const pointLight1 = new THREE.PointLight(0x00ffff, 2, 30);
+            pointLight1.position.set(10, 10, 10);
+            scene.add(pointLight1);
+
+            const pointLight2 = new THREE.PointLight(0xff00ff, 2, 30);
+            pointLight2.position.set(-10, -10, 10);
+            scene.add(pointLight2);
+
+            // オブジェクトを作成
+            createObjects();
+
+            // ポストプロセシング設定
+            setupPostProcessing();
+
+            // イベントリスナー
+            document.addEventListener('mousemove', onDocumentMouseMove);
+            document.addEventListener('click', onDocumentClick);
+            window.addEventListener('resize', onWindowResize);
+
+            // UI設定
+            setupUI();
+        }
+
+        function createObjects() {
+            objectsGroup = new THREE.Group();
+            scene.add(objectsGroup);
+
+            ribbonGroup = new THREE.Group();
+            objectsGroup.add(ribbonGroup);
+
+            const ribbonColors = [
+                0xff0080, 0x00ff80, 0x80ff00, 0xff8000,
+                0x0080ff, 0x8000ff, 0xffff00, 0x00ffff
+            ];
+
+            // リボンを異なる深度に配置
+            for (let i = 0; i < 8; i++) {
+                const points = [];
+                const segments = 15;
+                
+                for (let j = 0; j <= segments; j++) {
+                    const t = j / segments;
+                    const angle = t * Math.PI * 3 + (i * Math.PI / 4);
+                    const radius = 3 + Math.sin(t * Math.PI * 2);
+                    const x = Math.cos(angle) * radius;
+                    const y = (t - 0.5) * 8 + Math.sin(t * Math.PI * 3);
+                    const z = Math.sin(angle) * radius;
+                    points.push(new THREE.Vector3(x, y, z));
+                }
+
+                const curve = new THREE.CatmullRomCurve3(points);
+                const geometry = new THREE.TubeGeometry(curve, 50, 0.3, 8, false);
+                
+                const material = new THREE.MeshPhysicalMaterial({
+                    color: ribbonColors[i % ribbonColors.length],
+                    emissive: ribbonColors[i % ribbonColors.length],
+                    emissiveIntensity: 0.3,
+                    metalness: 0.6,
+                    roughness: 0.2,
+                    clearcoat: 0.5,
+                    transparent: false,
+                    opacity: 1.0
+                });
+
+                const ribbon = new THREE.Mesh(geometry, material);
+                // 前景、中景、背景に配置
+                const zPosition = (i % 3 - 1) * 15;
+                ribbon.position.z = zPosition;
+                ribbon.position.x = Math.cos(i) * 5;
+                ribbonGroup.add(ribbon);
+            }
+
+            // 異なる深度に球を配置
+            for (let i = 0; i < 15; i++) {
+                const sphereGeometry = new THREE.SphereGeometry(0.5 + Math.random() * 0.5, 16, 16);
+                const sphereMaterial = new THREE.MeshPhysicalMaterial({
+                    color: new THREE.Color().setHSL(Math.random(), 1, 0.5),
+                    emissive: new THREE.Color().setHSL(Math.random(), 1, 0.5),
+                    emissiveIntensity: 0.5,
+                    metalness: 0.8,
+                    roughness: 0.1,
+                    transparent: false,
+                    opacity: 1.0
+                });
+                
+                const sphere = new THREE.Mesh(sphereGeometry, sphereMaterial);
+                sphere.position.set(
+                    (Math.random() - 0.5) * 30,
+                    (Math.random() - 0.5) * 20,
+                    (Math.random() - 0.5) * 40
+                );
+                objectsGroup.add(sphere);
+            }
+
+            // パーティクル
+            const particlesGeometry = new THREE.BufferGeometry();
+            const particleCount = 300;
+            const positions = new Float32Array(particleCount * 3);
+            const particleColors = new Float32Array(particleCount * 3);
+
+            for (let i = 0; i < particleCount; i++) {
+                positions[i * 3] = (Math.random() - 0.5) * 50;
+                positions[i * 3 + 1] = (Math.random() - 0.5) * 50;
+                positions[i * 3 + 2] = (Math.random() - 0.5) * 50;
+
+                particleColors[i * 3] = Math.random();
+                particleColors[i * 3 + 1] = Math.random();
+                particleColors[i * 3 + 2] = Math.random();
+            }
+
+            particlesGeometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+            particlesGeometry.setAttribute('color', new THREE.BufferAttribute(particleColors, 3));
+
+            const particlesMaterial = new THREE.PointsMaterial({
+                size: 0.3,
+                vertexColors: true,
+                blending: THREE.NormalBlending,
+                transparent: false,
+                opacity: 1.0
+            });
+
+            const particles = new THREE.Points(particlesGeometry, particlesMaterial);
+            scene.add(particles);
+        }
+
+        function setupPostProcessing() {
+            // レンダーターゲット設定
+            const renderTargetParams = {
+                minFilter: THREE.LinearFilter,
+                magFilter: THREE.LinearFilter,
+                format: THREE.RGBAFormat
+            };
+
+            depthRenderTarget = new THREE.WebGLRenderTarget(
+                window.innerWidth,
+                window.innerHeight,
+                renderTargetParams
+            );
+
+            sceneRenderTarget = new THREE.WebGLRenderTarget(
+                window.innerWidth,
+                window.innerHeight,
+                renderTargetParams
+            );
+
+            cocRenderTarget = new THREE.WebGLRenderTarget(
+                window.innerWidth,
+                window.innerHeight,
+                renderTargetParams
+            );
+
+            blurRenderTarget1 = new THREE.WebGLRenderTarget(
+                window.innerWidth,
+                window.innerHeight,
+                renderTargetParams
+            );
+
+            blurRenderTarget2 = new THREE.WebGLRenderTarget(
+                window.innerWidth,
+                window.innerHeight,
+                renderTargetParams
+            );
+
+            // ポストプロセシング用シーン
+            postScene = new THREE.Scene();
+            postCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+
+            // 深度マテリアル
+            depthMaterial = new THREE.ShaderMaterial({
+                uniforms: {
+                    near: { value: camera.near },
+                    far: { value: camera.far }
+                },
+                vertexShader: depthVertexShader,
+                fragmentShader: depthFragmentShader
+            });
+
+            // CoC計算マテリアル
+            cocMaterial = new THREE.ShaderMaterial({
+                uniforms: {
+                    tDepth: { value: null },
+                    focusDistance: { value: params.focusDistance },
+                    aperture: { value: params.aperture },
+                    maxBlur: { value: params.maxBlur },
+                    near: { value: camera.near },
+                    far: { value: camera.far }
+                },
+                vertexShader: cocVertexShader,
+                fragmentShader: cocFragmentShader
+            });
+
+            // ブラーマテリアル
+            blurMaterial = new THREE.ShaderMaterial({
+                uniforms: {
+                    tDiffuse: { value: null },
+                    tCoC: { value: null },
+                    resolution: { value: new THREE.Vector2(window.innerWidth, window.innerHeight) },
+                    iteration: { value: 0 },
+                    maxBlur: { value: params.maxBlur }
+                },
+                vertexShader: blurVertexShader,
+                fragmentShader: blurFragmentShader
+            });
+
+            // DOF合成マテリアル
+            dofMaterial = new THREE.ShaderMaterial({
+                uniforms: {
+                    tScene: { value: null },
+                    tBlur: { value: null },
+                    tCoC: { value: null },
+                    bokehAmount: { value: params.bokehAmount }
+                },
+                vertexShader: dofVertexShader,
+                fragmentShader: dofFragmentShader
+            });
+
+            // 出力マテリアル
+            outputMaterial = new THREE.ShaderMaterial({
+                uniforms: {
+                    tDiffuse: { value: null }
+                },
+                vertexShader: outputVertexShader,
+                fragmentShader: outputFragmentShader
+            });
+
+            // 深度可視化マテリアル
+            depthVisMaterial = new THREE.ShaderMaterial({
+                uniforms: {
+                    tDepth: { value: null },
+                    tCoC: { value: null }
+                },
+                vertexShader: depthVisVertexShader,
+                fragmentShader: depthVisFragmentShader
+            });
+
+            // フルスクリーンクアッド
+            const quadGeometry = new THREE.PlaneGeometry(2, 2);
+            fullScreenQuad = new THREE.Mesh(quadGeometry, outputMaterial);
+            postScene.add(fullScreenQuad);
+        }
+
+        function setupUI() {
+            // DOF Controls
+            document.getElementById('enableDOF').addEventListener('change', (e) => {
+                params.enableDOF = e.target.checked;
+            });
+
+            document.getElementById('focusDistance').addEventListener('input', (e) => {
+                params.focusDistance = parseFloat(e.target.value);
+                document.getElementById('focusDistanceValue').textContent = params.focusDistance;
+                cocMaterial.uniforms.focusDistance.value = params.focusDistance;
+            });
+
+            document.getElementById('aperture').addEventListener('input', (e) => {
+                params.aperture = parseFloat(e.target.value);
+                document.getElementById('apertureValue').textContent = params.aperture;
+                cocMaterial.uniforms.aperture.value = params.aperture;
+            });
+
+            document.getElementById('bokehAmount').addEventListener('input', (e) => {
+                params.bokehAmount = parseFloat(e.target.value);
+                document.getElementById('bokehAmountValue').textContent = params.bokehAmount;
+                dofMaterial.uniforms.bokehAmount.value = params.bokehAmount;
+            });
+
+            document.getElementById('maxBlur').addEventListener('input', (e) => {
+                params.maxBlur = parseFloat(e.target.value);
+                document.getElementById('maxBlurValue').textContent = params.maxBlur;
+                cocMaterial.uniforms.maxBlur.value = params.maxBlur;
+                blurMaterial.uniforms.maxBlur.value = params.maxBlur;
+            });
+
+            document.getElementById('blurPasses').addEventListener('input', (e) => {
+                params.blurPasses = parseInt(e.target.value);
+                document.getElementById('blurPassesValue').textContent = params.blurPasses;
+            });
+
+            document.getElementById('autoFocus').addEventListener('change', (e) => {
+                params.autoFocus = e.target.checked;
+            });
+
+            document.getElementById('showDepth').addEventListener('change', (e) => {
+                params.showDepth = e.target.checked;
+            });
+
+            document.getElementById('animate').addEventListener('change', (e) => {
+                params.animate = e.target.checked;
+            });
+        }
+
+        function onDocumentMouseMove(event) {
+            mouseX = (event.clientX - windowHalfX) / windowHalfX;
+            mouseY = (event.clientY - windowHalfY) / windowHalfY;
+            
+            mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+        }
+
+        function onDocumentClick(event) {
+            // レイキャストでクリック位置の深度を取得
+            raycaster.setFromCamera(mouse, camera);
+            const intersects = raycaster.intersectObjects(objectsGroup.children, true);
+            
+            if (intersects.length > 0) {
+                const distance = intersects[0].distance;
+                params.focusDistance = distance;
+                document.getElementById('focusDistance').value = distance;
+                document.getElementById('focusDistanceValue').textContent = distance.toFixed(1);
+                cocMaterial.uniforms.focusDistance.value = distance;
+            }
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+
+            renderer.setSize(window.innerWidth, window.innerHeight);
+
+            // レンダーターゲットのリサイズ
+            depthRenderTarget.setSize(window.innerWidth, window.innerHeight);
+            sceneRenderTarget.setSize(window.innerWidth, window.innerHeight);
+            cocRenderTarget.setSize(window.innerWidth, window.innerHeight);
+            blurRenderTarget1.setSize(window.innerWidth, window.innerHeight);
+            blurRenderTarget2.setSize(window.innerWidth, window.innerHeight);
+
+            blurMaterial.uniforms.resolution.value.set(window.innerWidth, window.innerHeight);
+        }
+
+        function renderDepthPass() {
+            // 深度パスをレンダリング
+            const originalMaterials = [];
+            scene.traverse((obj) => {
+                if (obj.isMesh) {
+                    originalMaterials.push(obj.material);
+                    obj.material = depthMaterial;
+                }
+            });
+
+            renderer.setRenderTarget(depthRenderTarget);
+            renderer.render(scene, camera);
+
+            // マテリアルを元に戻す
+            let i = 0;
+            scene.traverse((obj) => {
+                if (obj.isMesh) {
+                    obj.material = originalMaterials[i++];
+                }
+            });
+        }
+
+        function renderDOF() {
+            // 1. 深度パスをレンダリング
+            renderDepthPass();
+
+            // 2. シーンを通常レンダリング
+            renderer.setRenderTarget(sceneRenderTarget);
+            renderer.clear();
+            renderer.render(scene, camera);
+
+            // 3. CoC計算
+            renderer.setRenderTarget(cocRenderTarget);
+            renderer.clear();
+            cocMaterial.uniforms.tDepth.value = depthRenderTarget.texture;
+            fullScreenQuad.material = cocMaterial;
+            renderer.render(postScene, postCamera);
+
+            // 4. ブラーパスを適用
+            let inputTarget = sceneRenderTarget;
+            let outputTarget = blurRenderTarget1;
+            let finalBlurTarget = sceneRenderTarget;
+
+            for (let i = 0; i < params.blurPasses; i++) {
+                // レンダーターゲットをクリア
+                renderer.setRenderTarget(outputTarget);
+                renderer.clear();
+                
+                // ブラー適用
+                blurMaterial.uniforms.tDiffuse.value = inputTarget.texture;
+                blurMaterial.uniforms.tCoC.value = cocRenderTarget.texture;
+                blurMaterial.uniforms.iteration.value = i;
+                fullScreenQuad.material = blurMaterial;
+                renderer.render(postScene, postCamera);
+
+                // 最終結果を保存
+                finalBlurTarget = outputTarget;
+
+                // ターゲットを交換（sceneRenderTargetは使わない）
+                if (i < params.blurPasses - 1) {
+                    inputTarget = outputTarget;
+                    outputTarget = (outputTarget === blurRenderTarget1) ? blurRenderTarget2 : blurRenderTarget1;
+                }
+            }
+
+            // 5. 最終合成または深度表示
+            renderer.setRenderTarget(null);
+            renderer.clear();
+            
+            if (params.showDepth) {
+                depthVisMaterial.uniforms.tDepth.value = depthRenderTarget.texture;
+                depthVisMaterial.uniforms.tCoC.value = cocRenderTarget.texture;
+                fullScreenQuad.material = depthVisMaterial;
+            } else {
+                dofMaterial.uniforms.tScene.value = sceneRenderTarget.texture;
+                dofMaterial.uniforms.tBlur.value = finalBlurTarget.texture;
+                dofMaterial.uniforms.tCoC.value = cocRenderTarget.texture;
+                fullScreenQuad.material = dofMaterial;
+            }
+            
+            renderer.render(postScene, postCamera);
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            // カメラの動き
+            targetX = mouseX * 15;
+            targetY = mouseY * 10;
+            
+            camera.position.x += (targetX - camera.position.x) * 0.05;
+            camera.position.y += (-targetY - camera.position.y) * 0.05;
+            camera.lookAt(scene.position);
+
+            // オートフォーカス
+            if (params.autoFocus) {
+                raycaster.setFromCamera(new THREE.Vector2(0, 0), camera);
+                const intersects = raycaster.intersectObjects(objectsGroup.children, true);
+                if (intersects.length > 0) {
+                    const targetFocus = intersects[0].distance;
+                    params.focusDistance += (targetFocus - params.focusDistance) * 0.1;
+                    cocMaterial.uniforms.focusDistance.value = params.focusDistance;
+                    document.getElementById('focusDistance').value = params.focusDistance;
+                    document.getElementById('focusDistanceValue').textContent = params.focusDistance.toFixed(1);
+                }
+            }
+
+            // アニメーション
+            if (params.animate && ribbonGroup) {
+                ribbonGroup.rotation.y += 0.002;
+                ribbonGroup.children.forEach((ribbon, i) => {
+                    ribbon.rotation.x += 0.001 * (i % 2 === 0 ? 1 : -1);
+                    ribbon.rotation.z += 0.0005 * (i % 3 === 0 ? 1 : -1);
+                });
+            }
+
+            // レンダリング
+            if (params.enableDOF) {
+                renderDOF();
+            } else {
+                renderer.setRenderTarget(null);
+                renderer.render(scene, camera);
+            }
+        }
+
+        // 初期化と実行
+        init();
+        animate();
+    </script>
+</body>
+</html>
