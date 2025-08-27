@@ -230,7 +230,7 @@
                 float coc = texture2D(tCoC, vUv).r;
 
                 // CoCに基づく混合係数の計算
-                float mixFactor = smoothstep(0.1, 0.9, coc * bokehAmount);
+                float mixFactor = smoothstep(0, 1.0, coc * bokehAmount);
 
                 // シンプルな線形補間
                 vec3 finalColor = mix(originalColor, blurredColor, mixFactor);
