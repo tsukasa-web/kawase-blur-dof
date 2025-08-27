@@ -8,7 +8,7 @@ A real-time depth of field implementation using Kawase blur algorithm with Three
 
 - **Kawase Blur Algorithm**: Efficient 4-tap sampling pattern for high-quality blur with minimal performance impact
 - **Physically-Based DOF**: Circle of Confusion (CoC) calculation based on camera parameters
-- **Real-time Interaction**: 
+- **Real-time Interaction**:
   - Mouse movement for camera control
   - Click to set focus point
   - Auto-focus mode
@@ -22,7 +22,7 @@ A real-time depth of field implementation using Kawase blur algorithm with Three
 
 ## Demo
 
-Open `kawase_blur.html` in a modern web browser to see the demo in action.
+Open `index.html` in a modern web browser to see the demo in action.
 
 **Controls:**
 - **Mouse Movement**: Rotate camera
@@ -118,7 +118,7 @@ Requires WebGL support and ES6 modules.
    ```
 
 2. **Open in browser**:
-   Simply open `kawase_blur.html` in any modern web browser. No build process required!
+   Simply open `index.html` in any modern web browser. No build process required!
 
 3. **Experiment with parameters**:
    - Try different aperture values (F1.4 vs F16)
