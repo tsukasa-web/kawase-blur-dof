@@ -2,7 +2,7 @@
 
 A real-time depth of field implementation using Kawase blur algorithm with Three.js. This project demonstrates physically-based depth of field effects with interactive controls for focus distance, aperture, and bokeh amount.
 
-![Kawase DOF Demo](screenshot.png)
+![Kawase DOF Demo](../screenshot.png)
 
 ## Features
 
